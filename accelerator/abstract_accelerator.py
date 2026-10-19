@@ -215,6 +215,10 @@ class DeepSpeedAccelerator(ABC):
     def prefer_triton_grouped_mm(self):
         return False
 
+    def get_grouped_mm(self):
+        """Return a native differentiable grouped GEMM override, if available."""
+        return None
+
     # Graph operations
     def is_current_stream_capturing(self) -> bool:
         return False
