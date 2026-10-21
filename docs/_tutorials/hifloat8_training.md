@@ -5,11 +5,12 @@
 title: "TorchAO HiFloat8 training"
 ---
 
-DeepSpeed selects ordinary Linear and AutoEP GroupedExperts modules, probes the
-active accelerator's optional HiFloat8 APIs, and converts both kinds through one
-public `torchao.quantization.quantize_` call. DeepSpeed owns selection, activation,
-routing/padding, communication, optimizer and checkpoint lifecycle. TorchAO owns
-numerical policy and the quantization/GEMM implementations.
+DeepSpeed selects ordinary Linear and AutoEP GroupedExperts modules and converts
+both kinds through one public `torchao.quantization.quantize_` call after
+validating the grouped kernels through the config's `assert_kernels_available`;
+the conversions themselves never probe. DeepSpeed owns selection,
+activation, routing/padding, communication, optimizer and checkpoint lifecycle.
+TorchAO owns numerical policy and the quantization/GEMM implementations.
 
 ## Quick start
 
@@ -59,17 +60,17 @@ implementation lazily returns the public `torchao.hifloat8` APIs after checking
 optional dependency/version availability. Unsupported accelerators fail before
 conversion. No NPU import or device-specific kernel selection occurs in Engine.
 
-`ModuleFqnToConfig` maps selected Linear modules to `HiFloat8Config` and selected
-experts to AO's `HiFloat8GroupedConfig`. Both parse the same numerical settings
-through their common `HiFloat8Config` base. Each recipe is immutable and reused
-across its selected modules; no nested policy wrapper is needed.
-Both handlers are registered by AO. The grouped handler binds AO's existing GEMM
-through the module's `grouped_mm` slot; it does not import a DeepSpeed container.
-Engine selects configurations and calls `quantize_`, without defining a handler
-or selecting a grouped function. Both preserve Parameter identity, names, metadata, `requires_grad`,
-mode and state-dict keys. There is no second model-conversion API or registry.
-The expert container remains owned by DeepSpeed and retains its activation and
-routing/padding behavior.
+`FqnToConfig` maps selected Linear modules and each expert container's
+grouped-GEMM modules to the single `HiFloat8Config`. The engine validates the
+grouped kernels once through the config's `assert_kernels_available` before
+conversion; the conversions themselves only swap the Linear class or replace
+the GEMM module's forward with the same contract backed by the low-precision
+kernel, without probing. Both
+preserve Parameter identity, names, metadata, `requires_grad`, mode and
+state-dict keys. There is no second model-conversion API or registry. The expert
+container remains owned by DeepSpeed and retains its activation and
+routing/padding behavior; its grouped GEMMs run through built-in `GroupedGemm`
+modules that also serve the high-precision path.
 
 The separate `get_grouped_mm()` accelerator hook supplies ordinary high-precision
 GEMM. Its NPU implementation calls TorchNPU with explicit list-input autograd,
@@ -81,15 +82,13 @@ its existing implementation.
 
 ## Optional TorchAO policy
 
-Install `torchao>=0.18,<0.19` and the paired Ascend extension with public HiFloat8
-policy/probe APIs and registered handlers. Selected experts additionally require
-`HiFloat8GroupedConfig`; Dense-only selection does not require grouped exports.
-With the extension's automatic activation enabled, DeepSpeed imports
-`torchao.hifloat8`; users do not need to import `torchao_npu` or convert the model
-manually. Upstream TorchAO alone does not provide this HiFloat8 implementation.
-Missing APIs, versions,
-invalid policy or unavailable requested forward/dX/dW kernels fail before
-conversion; policy parsing uses `HiFloat8Config.from_dict`.
+Install `torchao>=0.18,<0.19` and the paired Ascend extension exposing the single
+`HiFloat8Config` symbol. An upstream Linear-only extension is insufficient.
+No backend import or user preloading step is required. Missing APIs, versions or an
+invalid policy fail before conversion. DeepSpeed requires nothing else from the
+extension: the cached kernel validation (`grouped_config.assert_kernels_available`)
+travels with the config object, and conversion attaches each expert GEMM's policy to
+the module's `config` slot; policy parsing uses `HiFloat8Config.from_dict`.
 
 Missing, null or empty `config` uses the established input/weight/gradient scale
 denominators `15/15/224`. Explicit overrides remain supported. `compute_dtype`

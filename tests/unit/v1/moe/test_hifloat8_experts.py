@@ -10,6 +10,19 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.moe.ep_experts import GroupedExperts
 
 
+def test_gemm_modules_do_not_change_the_model_structure(monkeypatch):
+    # Statelessness is the whole point: the GEMM modules must not re-register
+    # the container's parameters or add state-dict keys (old checkpoints and
+    # AutoEP parameter tracking depend on the three-key layout).
+    from deepspeed.accelerator import get_accelerator
+
+    monkeypatch.setattr(get_accelerator(), "get_grouped_mm", lambda: torch.matmul)
+    experts = GroupedExperts(8, 16, 2, use_grouped_mm=True)
+    assert tuple(experts.state_dict()) == ("w1", "w2", "w3")
+    assert tuple(experts.named_parameters()) == (("w1", experts.w1), ("w2", experts.w2), ("w3", experts.w3))
+    assert all(getattr(module, attr, None) is None for module in experts.children() for attr in ("weight", "trans_b"))
+
+
 @pytest.mark.parametrize("counts", [[2, 1], [0, 3], [3, 0], [0, 0]])
 def test_reference_experts_match_independent_linear_modules(counts):
     # Catches wrong gate/up/down orientation and lost empty-expert gradients.
@@ -50,6 +63,9 @@ def test_npu_expert_helper_preserves_upstream_activation(monkeypatch):
     """The NPU GEMM dispatch must use AutoEP's resolved expert activation."""
     # Pin the merge regression without NPU hardware: the stub implements the
     # native grouped GEMM contract while the helper supplies activation policy.
+    from types import SimpleNamespace
+
+    from deepspeed.accelerator import get_accelerator
     import deepspeed.moe.ep_experts as ep_experts
 
     def fake_grouped_mm(lhs, weight, offsets, *, trans_b=False):
@@ -57,19 +73,19 @@ def test_npu_expert_helper_preserves_upstream_activation(monkeypatch):
         starts = [0] + offsets.tolist()[:-1]
         return torch.cat([lhs[start:end] @ weight[i] for i, (start, end) in enumerate(zip(starts, offsets.tolist()))])
 
+    monkeypatch.setattr(get_accelerator(), "get_grouped_mm", lambda: fake_grouped_mm)
     torch.manual_seed(7)
     counts = torch.tensor([2, 1])
     x = torch.randn(4, 8, requires_grad=True)
     weights = [torch.randn(shape, requires_grad=True) for shape in ((2, 16, 8), (2, 8, 16), (2, 16, 8))]
     w1, w2, w3 = weights
-    actual = ep_experts._run_experts_with_grouped_mm(w1,
-                                                     w2,
-                                                     w3,
-                                                     x,
-                                                     counts,
-                                                     "swiglu_clamped",
-                                                     limit=0.5,
-                                                     grouped_mm=fake_grouped_mm)
+    holder = SimpleNamespace(gmm1=ep_experts.GroupedGemm(),
+                             gmm2=ep_experts.GroupedGemm(),
+                             gmm3=ep_experts.GroupedGemm(),
+                             w1=w1,
+                             w2=w2,
+                             w3=w3)
+    actual = ep_experts._run_experts_with_gemm_modules(holder, x, counts, "swiglu_clamped", limit=0.5)
 
     x_ref = x.detach().clone().requires_grad_()
     w1_ref, w2_ref, w3_ref = [w.detach().clone().requires_grad_() for w in weights]
@@ -109,10 +125,16 @@ def test_npu_hifloat8_expert_forward_and_gradients(counts, dim, hidden_dim, back
     candidate = GroupedExperts(dim, hidden_dim, len(counts)).to(device="npu", dtype=torch.bfloat16)
     candidate.load_state_dict(baseline.state_dict())
     if backend == "torchao":
-        from torchao.quantization import quantize_
-        from torchao.hifloat8 import HiFloat8GroupedConfig
+        from collections import OrderedDict
 
-        quantize_(candidate, HiFloat8GroupedConfig(), filter_fn=lambda module, name: name == "")
+        from torchao.quantization import FqnToConfig, quantize_
+
+        provider = get_accelerator().get_hifloat8_provider()
+        op_config = provider.HiFloat8Config.from_dict({"grouped": {}})
+        gemm_names = [
+            name for name, child in candidate.named_children() if getattr(child, "is_torchao_grouped_gemm", False)
+        ]
+        quantize_(candidate, FqnToConfig(OrderedDict((name, op_config) for name in gemm_names)), filter_fn=None)
     x = torch.randn(sum(counts), dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
     candidate_x = x.detach().clone().requires_grad_()
     groups = torch.tensor(counts, device="npu", dtype=torch.int64)
@@ -198,11 +220,14 @@ def test_npu_provider_experts_preserve_bfloat16_residual_with_float16_compute():
             weight.normal_(std=0.02)
     parameters = dict(experts.named_parameters())
     state_keys = tuple(experts.state_dict())
-    from torchao.quantization import quantize_
-    from torchao.hifloat8 import HiFloat8GroupedConfig
+    from collections import OrderedDict
 
-    policy = HiFloat8GroupedConfig.from_dict({"compute_dtype": "float16"})
-    quantize_(experts, policy, filter_fn=lambda module, name: name == "")
+    from torchao.quantization import FqnToConfig, quantize_
+
+    provider = get_accelerator().get_hifloat8_provider()
+    op_config = provider.HiFloat8Config.from_dict({"grouped": {"compute_dtype": "float16"}})
+    gemm_names = [name for name, child in experts.named_children() if getattr(child, "is_torchao_grouped_gemm", False)]
+    quantize_(experts, FqnToConfig(OrderedDict((name, op_config) for name in gemm_names)), filter_fn=None)
     counts = torch.tensor([0, 8, 0, 4], device="npu", dtype=torch.int64)
     x = torch.randn(15, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
     branch = experts(x, counts)
@@ -225,15 +250,16 @@ def test_npu_provider_experts_preserve_bfloat16_residual_with_float16_compute():
         assert bool(torch.isfinite(parameter.grad).all())
 
 
-def test_grouped_override_rejects_explicit_fused_gate_up():
+def test_grouped_override_rejects_explicit_fused_gate_up(monkeypatch):
     # Upstream can request a fused gate/up path; a three-GEMM override cannot
     # silently ignore that public choice after this integration is merged.
-    experts = GroupedExperts(8, 16, 2, use_grouped_mm=False)
-    experts.gate_up_impl = "fused"
+    from deepspeed.accelerator import get_accelerator
 
     def unexpected_kernel(*args, **kwargs):
         raise AssertionError("Unsupported execution must fail before a GEMM")
 
-    experts.grouped_mm = unexpected_kernel
+    monkeypatch.setattr(get_accelerator(), "get_grouped_mm", lambda: unexpected_kernel)
+    experts = GroupedExperts(8, 16, 2, use_grouped_mm=True)
+    experts.gate_up_impl = "fused"
     with pytest.raises(RuntimeError, match="separate gate/up"):
         experts(torch.randn(2, 8), torch.tensor([1, 1]))

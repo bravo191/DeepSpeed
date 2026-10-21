@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
-from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -117,18 +116,18 @@ def test_hifloat8_config_selects_torchao_npu():
 def test_torchao_backend_preserves_dense_and_grouped_parameters(policy, monkeypatch):
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("NPU unavailable")
+    import torchao.hifloat8.hifloat8_grouped as grouped_kernels
     from deepspeed.moe.ep_experts import GroupedExperts
-    from torchao.hifloat8 import HiFloat8Linear
-    import torchao.hifloat8.hifloat8_grouped as api
+    from torchao.hifloat8 import HiFloat8GroupedConfig, HiFloat8Linear
 
     policies = []
-    original = api.hifloat8_grouped_mm
+    original = grouped_kernels._hifloat8_grouped_mm
 
-    def recorded(*args, **kwargs):
+    def recorded(x, weight, offsets, **kwargs):
         policies.append(kwargs["config"])
-        return original(*args, **kwargs)
+        return original(x, weight, offsets, **kwargs)
 
-    monkeypatch.setattr(api, "hifloat8_grouped_mm", recorded)
+    monkeypatch.setattr(grouped_kernels, "_hifloat8_grouped_mm", recorded)
     model = nn.ModuleDict({
         "dense": nn.Linear(16, 16, bias=False),
         "experts": GroupedExperts(16, 32, 2, use_grouped_mm=True),
@@ -145,11 +144,11 @@ def test_torchao_backend_preserves_dense_and_grouped_parameters(policy, monkeypa
     engine._configure_hifloat8()
 
     assert isinstance(model["dense"], HiFloat8Linear)
-    assert model["experts"].grouped_mm is not None
+    assert model["experts"].gmm1.config is not None
     x = torch.randn(16, 16, device="npu", dtype=torch.bfloat16)
     model["experts"](model["dense"](x), torch.tensor([0, 16], device="npu", dtype=torch.int64))
-    assert policies and all(value is policies[0] for value in policies)
-    assert asdict(policies[0]) == asdict(model["dense"].config)
+    assert policies and all(value == (HiFloat8GroupedConfig.from_dict(policy) if policy else HiFloat8GroupedConfig())
+                            for value in policies)
     assert model["dense"].config.grad_dst_type_max == (policy.get("grad_dst_type_max", 224) if policy else 224)
     assert tuple(model.state_dict()) == keys_before
     assert all(dict(model.named_parameters())[name] is parameter for name, parameter in parameters_before.items())
@@ -192,26 +191,24 @@ def _make_engine(model, patterns, min_numel=0):
 
 
 @requires_npu
-def test_engine_selects_routed_experts_without_replacing_parameters(monkeypatch):
+def test_engine_selects_routed_experts_without_replacing_parameters():
     if not hasattr(torch, "npu"):
         pytest.skip("NPU accelerator required")
     # Catches silently selecting the router or orphaning packed expert weights.
     from deepspeed.moe.ep_experts import GroupedExperts
-    import torchao.hifloat8 as implementation
 
     model = nn.ModuleDict({
-        "experts": GroupedExperts(8, 16, 2, use_grouped_mm=False),
+        "experts": GroupedExperts(8, 16, 2, use_grouped_mm=True),
         "router": nn.Linear(8, 2, bias=False),
     })
     model.experts.w1.requires_grad_(False)
     parameters = dict(model.named_parameters())
     keys = tuple(model.state_dict())
-    monkeypatch.setattr(implementation, "assert_hifloat8_training_available", lambda **kwargs: None)
     engine = _make_engine(model, ["experts"])
     engine._configure_hifloat8()
     assert engine.hifloat8_grouped_module_names == ("experts", )
     assert engine.hifloat8_converted_module_names == ()
-    assert model.experts.grouped_mm is not None
+    assert model.experts.gmm1.config is not None
     assert type(model.router) is nn.Linear
     assert not model.experts.w1.requires_grad
     assert tuple(model.state_dict()) == keys
@@ -219,29 +216,19 @@ def test_engine_selects_routed_experts_without_replacing_parameters(monkeypatch)
 
 
 @requires_npu
-def test_engine_converts_only_selected_modules_and_preserves_parameters(monkeypatch):
+def test_engine_converts_only_selected_modules_and_preserves_parameters():
     if not hasattr(torch, "npu"):
         pytest.skip("NPU accelerator required")
     model = _ToyModel()
     before = dict(model.named_parameters())
-    probe_calls = []
     import torchao.hifloat8 as implementation
 
     HiFloat8Linear = implementation.HiFloat8Linear
 
-    monkeypatch.setattr(
-        implementation,
-        "assert_hifloat8_training_available",
-        lambda **kwargs: probe_calls.append(kwargs),
-    )
     engine = _make_engine(model, ["*.mlp.gate_proj", "*.mlp.up_proj", "*.mlp.down_proj"])
     engine._config.hifloat8_config["expected_module_count"] = 3
     engine._configure_hifloat8()
 
-    assert len(probe_calls) == 1
-    assert probe_calls[0]["device"] == torch.device("cpu")
-    assert probe_calls[0]["linear"] and not probe_calls[0]["grouped"]
-    assert probe_calls[0]["config"] is model.model.mlp["gate_proj"].config
     assert engine.hifloat8_converted_module_names == (
         "model.mlp.gate_proj",
         "model.mlp.up_proj",
@@ -309,7 +296,7 @@ def test_missing_optional_backend_reports_selection_before_model_mutation(monkey
     parameters = dict(model.named_parameters())
     engine = _make_engine(model, ["*.mlp.gate_proj"])
     with pytest.raises(RuntimeError,
-                       match=r"selected 1 Linear modules \(32 matrix elements\).+before conversion") as caught:
+                       match=r"selected 1 Linear modules \(32 matrix elements\).+conversion failed") as caught:
         engine._configure_hifloat8()
     assert caught.value.__cause__ is error
     assert type(model.model.mlp["gate_proj"]) is nn.Linear
@@ -325,28 +312,28 @@ def test_hifloat8_validation_rejects_custom_model_parallel_unit():
 
 
 @requires_npu
-@pytest.mark.parametrize("error", [RuntimeError("unsupported device"), ImportError("missing torchao_npu backend")])
-def test_engine_kernel_failure_reports_selection_and_does_not_mutate(monkeypatch, error):
+def test_engine_grouped_kernel_failure_reports_selection_before_conversion(monkeypatch):
     if not hasattr(torch, "npu"):
         pytest.skip("NPU accelerator required")
-    import torchao.hifloat8 as implementation
+    # The grouped backend validation is an explicit engine step: a broken
+    # backend must fail before quantize_ touches any module.
+    from torchao.hifloat8 import HiFloat8GroupedConfig
+    from deepspeed.moe.ep_experts import GroupedExperts
 
-    model = _ToyModel()
-    before = dict(model.named_parameters())
+    model = nn.ModuleDict({"experts": GroupedExperts(16, 32, 2, use_grouped_mm=True)})
+    parameters = dict(model.named_parameters())
+    error = RuntimeError("grouped kernels unavailable")
 
-    def fail_probe(**_kwargs):
+    def unavailable(_self, *, device):
         raise error
 
-    monkeypatch.setattr(implementation, "assert_hifloat8_training_available", fail_probe)
-    engine = _make_engine(model, ["*.mlp.gate_proj"])
-
-    with pytest.raises(RuntimeError, match=r"selected 1 Linear modules \(32 matrix elements\).+before conversion"):
+    monkeypatch.setattr(HiFloat8GroupedConfig, "assert_kernels_available", unavailable)
+    engine = _make_engine(model, ["experts"])
+    with pytest.raises(RuntimeError, match="conversion failed") as caught:
         engine._configure_hifloat8()
-
-    assert type(model.model.mlp["gate_proj"]) is nn.Linear
-    after = dict(model.named_parameters())
-    assert before.keys() == after.keys()
-    assert all(after[name] is parameter for name, parameter in before.items())
+    assert caught.value.__cause__ is error
+    assert model.experts.gmm1.config is None
+    assert all(dict(model.named_parameters())[name] is p for name, p in parameters.items())
 
 
 @pytest.mark.parametrize("policy", [True, 1, "bf16", []])
@@ -399,38 +386,6 @@ def test_accelerator_without_hifloat8_fails_before_conversion(monkeypatch):
     assert type(model.model.mlp["gate_proj"]) is nn.Linear
 
 
-@requires_npu
-@pytest.mark.parametrize("grouped", [False, True])
-def test_engine_requires_grouped_config_only_when_experts_are_selected(monkeypatch, grouped):
-    # A Linear-only backend must work; a missing grouped handler must fail before any conversion.
-    import torchao.hifloat8 as api
-    from deepspeed.accelerator import get_accelerator
-    from deepspeed.moe.ep_experts import GroupedExperts
-
-    provider = SimpleNamespace(HiFloat8Config=api.HiFloat8Config,
-                               assert_hifloat8_training_available=api.assert_hifloat8_training_available)
-    monkeypatch.setattr(get_accelerator(), "get_hifloat8_provider", lambda: provider)
-    model = nn.ModuleDict({"dense": nn.Linear(16, 16)})
-    if grouped:
-        model["experts"] = GroupedExperts(16, 32, 2, use_grouped_mm=False)
-    model = model.to("npu").bfloat16()
-    parameters = dict(model.named_parameters())
-    engine = _make_engine(model, list(model))
-    engine.device = torch.device("npu:0")
-    if grouped:
-        with pytest.raises(RuntimeError, match="HiFloat8GroupedConfig"):
-            engine._configure_hifloat8()
-        assert type(model["dense"]) is nn.Linear
-        assert model["experts"].grouped_mm is None
-    else:
-        engine._configure_hifloat8()
-        assert isinstance(model["dense"], api.HiFloat8Linear)
-        output = model["dense"](torch.ones(16, 16, device="npu", dtype=torch.bfloat16))
-        output.float().sum().backward()
-        assert bool(torch.isfinite(output).all())
-    assert all(dict(model.named_parameters())[name] is value for name, value in parameters.items())
-
-
 def test_npu_provider_missing_dependency_has_install_hint(monkeypatch):
     from importlib.metadata import PackageNotFoundError
     from deepspeed.accelerator.npu import hifloat8
@@ -459,13 +414,13 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
 
     torch.manual_seed(59)
     if kind == "mixed":
-        model = nn.ModuleDict({"dense": nn.Linear(16, 16), "experts": GroupedExperts(16, 32, 2, use_grouped_mm=False)})
+        model = nn.ModuleDict({"dense": nn.Linear(16, 16), "experts": GroupedExperts(16, 32, 2, use_grouped_mm=True)})
         patterns = ["dense", "experts"]
     elif kind == "linear":
         model = nn.Linear(16, 16)
         patterns = ["*"]
     else:
-        model = GroupedExperts(16, 32, 2, use_grouped_mm=False)
+        model = GroupedExperts(16, 32, 2, use_grouped_mm=True)
         patterns = ["*"]
     model = model.to("npu").bfloat16()
     with torch.no_grad():
@@ -475,14 +430,15 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
     keys = tuple(model.state_dict())
     calls = []
     policies = []
-    import torchao.hifloat8.hifloat8_grouped as api
-    original_grouped = api.hifloat8_grouped_mm
+    import torchao.hifloat8.hifloat8_grouped as grouped_kernels
+    from torchao.hifloat8 import HiFloat8GroupedConfig
+    original_grouped = grouped_kernels._hifloat8_grouped_mm
 
-    def recorded_grouped(*args, **kwargs):
+    def recorded_grouped(x, weight, offsets, **kwargs):
         policies.append(kwargs["config"])
-        return original_grouped(*args, **kwargs)
+        return original_grouped(x, weight, offsets, **kwargs)
 
-    monkeypatch.setattr(api, "hifloat8_grouped_mm", recorded_grouped)
+    monkeypatch.setattr(grouped_kernels, "_hifloat8_grouped_mm", recorded_grouped)
     original = quantization.quantize_
 
     def counted(actual_model, config, **kwargs):
@@ -506,11 +462,10 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
         assert isinstance(model, HiFloat8Linear)
         output = model(x)
     else:
-        assert model.grouped_mm is not None
+        assert model.gmm1.config is not None
         output = model(x, counts)
     if kind == "mixed":
-        assert policies and all(value is policies[0] for value in policies)
-        assert asdict(policies[0]) == asdict(model["dense"].config)
+        assert policies and all(value == HiFloat8GroupedConfig() for value in policies)
     assert output.dtype == x.dtype
     output.float().square().mean().backward()
     assert bool(torch.isfinite(x.grad).all())

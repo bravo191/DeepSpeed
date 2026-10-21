@@ -13,7 +13,6 @@ parallel routing is validated separately with a model integration run.
 """
 import argparse
 import copy
-from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -24,8 +23,8 @@ import deepspeed
 import deepspeed.comm as dist
 from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.runtime.fp16.loss_scaler import LossScaler
-from torchao.hifloat8 import HiFloat8Config
-import torchao.hifloat8.hifloat8_grouped as hifloat8_api
+from torchao.hifloat8 import HiFloat8GroupedConfig, HiFloat8LinearConfig
+import torchao.hifloat8.hifloat8_grouped as grouped_kernels
 
 
 class Model(torch.nn.Module):
@@ -33,7 +32,7 @@ class Model(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.dense = torch.nn.Linear(128, 128, bias=False)
-        self.experts = GroupedExperts(128, 128, 2, use_grouped_mm=False)
+        self.experts = GroupedExperts(128, 128, 2, use_grouped_mm=True)
         with torch.no_grad():
             for p in self.parameters():
                 p.normal_(std=0.02)
@@ -105,27 +104,27 @@ def main():
     targets = [torch.randn(32, 128, generator=generator).bfloat16().to('npu') * 0.01 for _ in range(8)]
 
     observed_policies = []
-    original_grouped_mm = hifloat8_api.hifloat8_grouped_mm
+    original_grouped_mm = grouped_kernels._hifloat8_grouped_mm
 
-    def recorded_grouped_mm(*args, **kwargs):
+    def recorded_grouped_mm(x, weight, offsets, **kwargs):
         observed_policies.append(kwargs["config"])
-        return original_grouped_mm(*args, **kwargs)
+        return original_grouped_mm(x, weight, offsets, **kwargs)
 
-    hifloat8_api.hifloat8_grouped_mm = recorded_grouped_mm
+    grouped_kernels._hifloat8_grouped_mm = recorded_grouped_mm
 
     def create():
         model = Model().bfloat16()
         model.load_state_dict(initial)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         engine, _, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config=config)
-        assert isinstance(engine.module.dense.config, HiFloat8Config)
+        assert isinstance(engine.module.dense.config, HiFloat8LinearConfig)
         return engine
 
     def step(engine, i):
         observed_policies.clear()
         loss = (engine(batches[i]).float() - targets[i].float()).square().mean()
-        assert observed_policies and all(policy is observed_policies[0] for policy in observed_policies)
-        assert asdict(observed_policies[0]) == asdict(engine.module.dense.config)
+        # The grouped GEMM carries the grouped sub-config of the same default recipe.
+        assert observed_policies and all(policy == HiFloat8GroupedConfig() for policy in observed_policies)
         engine.backward(loss)
         engine.step()
         return float(loss.detach())
@@ -158,7 +157,7 @@ def main():
         'resume_losses': resumed_losses,
         'parameters_exact': True,
         'optimizer_exact': True,
-        'same_policy_values': True
+        'same_policy_recipe': True
     }
     (args.output / f'result_rank{rank}.json').write_text(json.dumps(result, indent=2))
     dist.barrier()

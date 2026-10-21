@@ -2130,9 +2130,19 @@ class DeepSpeedEngine(Module):
             raise RuntimeError(f"HiFloat8 patterns matched no eligible modules: {unmatched}")
         if any(getattr(module, "gate_up_impl", "auto") == "fused" for _name, module in selected_experts):
             raise RuntimeError("HiFloat8 experts require separate gate/up projections")
+        expert_gemm_names = []
+        for container_name, container in selected_experts:
+            gemm_children = [
+                child_name for child_name, child in container.named_children()
+                if getattr(child, "is_torchao_grouped_gemm", False)
+            ]
+            if not gemm_children:
+                raise RuntimeError("HiFloat8 requires GroupedExperts constructed with use_grouped_mm=True; "
+                                   f"{container_name} exposes no grouped-GEMM modules")
+            expert_gemm_names.extend(f"{container_name}.{child_name}" for child_name in gemm_children)
 
         logger.info(
-            "HiFloat8 selected %d Linear modules (%d matrix elements); probing native kernels before conversion",
+            "HiFloat8 selected %d Linear modules (%d matrix elements); converting through the public quantize_ entry",
             len(selected_names),
             total_numel,
         )
@@ -2140,25 +2150,23 @@ class DeepSpeedEngine(Module):
             provider = get_accelerator().get_hifloat8_provider()
             if provider is None:
                 raise RuntimeError(f"No HiFloat8 provider on {get_accelerator().device_name()}")
-            policy = provider.HiFloat8Config.from_dict(config.get("config"))
-            grouped_policy = None
-            if selected_experts:
-                if not hasattr(provider, "HiFloat8GroupedConfig"):
-                    raise ImportError("Install a compatible TorchAO extension providing HiFloat8GroupedConfig")
-                grouped_policy = provider.HiFloat8GroupedConfig.from_dict(config.get("config"))
-            provider.assert_hifloat8_training_available(device=self.device,
-                                                        config=policy,
-                                                        linear=bool(selected_names),
-                                                        grouped=bool(selected_experts))
+            # One training-op config drives both classes. The grouped kernels
+            # are validated once up front through the config's probe; the
+            # conversions themselves never probe, so a broken dense backend
+            # surfaces at the first training step.
+            policy = config.get("config") or {}
+            op_config = provider.HiFloat8Config.from_dict({"linear": policy, "grouped": policy})
+            if expert_gemm_names:
+                op_config.grouped_config.assert_kernels_available(device=self.device)
+            from torchao.quantization import FqnToConfig, quantize_
+
+            module_configs = {name: op_config for name in selected_names}
+            module_configs.update({name: op_config for name in expert_gemm_names})
+            quantize_(self.module, FqnToConfig(module_configs), filter_fn=None)
         except (ImportError, RuntimeError, ValueError, TypeError) as error:
             raise RuntimeError(
                 f"HiFloat8 selected {len(selected_names)} Linear modules ({total_numel} matrix elements), "
-                f"but provider/native kernel validation failed before conversion: {error}") from error
-        from torchao.quantization import ModuleFqnToConfig, quantize_
-
-        module_configs = {name: policy for name in selected_names}
-        module_configs.update({name: grouped_policy for name, _module in selected_experts})
-        quantize_(self.module, ModuleFqnToConfig(module_configs), filter_fn=None)
+                f"but the HiFloat8 provider or conversion failed: {error}") from error
         self.hifloat8_converted_module_names = tuple(selected_names)
         self.hifloat8_grouped_module_names = tuple(name for name, _ in selected_experts)
         logger.info("HiFloat8 enabled %d AutoEP grouped expert modules: %s", len(selected_experts),
