@@ -116,18 +116,18 @@ def test_hifloat8_config_selects_torchao_npu():
 def test_torchao_backend_preserves_dense_and_grouped_parameters(policy, monkeypatch):
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("NPU unavailable")
-    import torchao.hifloat8.hifloat8_grouped as grouped_kernels
+    import torchao.hifloat8.hifloat8_gmm as grouped_kernels
     from deepspeed.moe.ep_experts import GroupedExperts
-    from torchao.hifloat8 import HiFloat8GroupedConfig, HiFloat8Linear
+    from torchao.hifloat8 import HiFloat8GMMConfig, HiFloat8Linear
 
     policies = []
-    original = grouped_kernels._hifloat8_grouped_mm
+    original = grouped_kernels._hifloat8_gmm
 
     def recorded(x, weight, offsets, **kwargs):
         policies.append(kwargs["config"])
         return original(x, weight, offsets, **kwargs)
 
-    monkeypatch.setattr(grouped_kernels, "_hifloat8_grouped_mm", recorded)
+    monkeypatch.setattr(grouped_kernels, "_hifloat8_gmm", recorded)
     model = nn.ModuleDict({
         "dense": nn.Linear(16, 16, bias=False),
         "experts": GroupedExperts(16, 32, 2, use_grouped_mm=True),
@@ -147,7 +147,7 @@ def test_torchao_backend_preserves_dense_and_grouped_parameters(policy, monkeypa
     assert model["experts"].gmm1.config is not None
     x = torch.randn(16, 16, device="npu", dtype=torch.bfloat16)
     model["experts"](model["dense"](x), torch.tensor([0, 16], device="npu", dtype=torch.int64))
-    assert policies and all(value == (HiFloat8GroupedConfig.from_dict(policy) if policy else HiFloat8GroupedConfig())
+    assert policies and all(value == (HiFloat8GMMConfig.from_dict(policy) if policy else HiFloat8GMMConfig())
                             for value in policies)
     assert model["dense"].config.grad_dst_type_max == (policy.get("grad_dst_type_max", 224) if policy else 224)
     assert tuple(model.state_dict()) == keys_before
@@ -206,7 +206,7 @@ def test_engine_selects_routed_experts_without_replacing_parameters():
     keys = tuple(model.state_dict())
     engine = _make_engine(model, ["experts"])
     engine._configure_hifloat8()
-    assert engine.hifloat8_grouped_module_names == ("experts", )
+    assert engine.hifloat8_gmm_module_names == ("experts", )
     assert engine.hifloat8_converted_module_names == ()
     assert model.experts.gmm1.config is not None
     assert type(model.router) is nn.Linear
@@ -317,7 +317,7 @@ def test_engine_grouped_kernel_failure_reports_selection_before_conversion(monke
         pytest.skip("NPU accelerator required")
     # The grouped backend validation is an explicit engine step: a broken
     # backend must fail before quantize_ touches any module.
-    from torchao.hifloat8 import HiFloat8GroupedConfig
+    from torchao.hifloat8 import HiFloat8GMMConfig
     from deepspeed.moe.ep_experts import GroupedExperts
 
     model = nn.ModuleDict({"experts": GroupedExperts(16, 32, 2, use_grouped_mm=True)})
@@ -327,7 +327,7 @@ def test_engine_grouped_kernel_failure_reports_selection_before_conversion(monke
     def unavailable(_self, *, device):
         raise error
 
-    monkeypatch.setattr(HiFloat8GroupedConfig, "assert_kernels_available", unavailable)
+    monkeypatch.setattr(HiFloat8GMMConfig, "assert_kernels_available", unavailable)
     engine = _make_engine(model, ["experts"])
     with pytest.raises(RuntimeError, match="conversion failed") as caught:
         engine._configure_hifloat8()
@@ -430,15 +430,15 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
     keys = tuple(model.state_dict())
     calls = []
     policies = []
-    import torchao.hifloat8.hifloat8_grouped as grouped_kernels
-    from torchao.hifloat8 import HiFloat8GroupedConfig
-    original_grouped = grouped_kernels._hifloat8_grouped_mm
+    import torchao.hifloat8.hifloat8_gmm as grouped_kernels
+    from torchao.hifloat8 import HiFloat8GMMConfig
+    original_grouped = grouped_kernels._hifloat8_gmm
 
     def recorded_grouped(x, weight, offsets, **kwargs):
         policies.append(kwargs["config"])
         return original_grouped(x, weight, offsets, **kwargs)
 
-    monkeypatch.setattr(grouped_kernels, "_hifloat8_grouped_mm", recorded_grouped)
+    monkeypatch.setattr(grouped_kernels, "_hifloat8_gmm", recorded_grouped)
     original = quantization.quantize_
 
     def counted(actual_model, config, **kwargs):
@@ -465,7 +465,7 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
         assert model.gmm1.config is not None
         output = model(x, counts)
     if kind == "mixed":
-        assert policies and all(value == HiFloat8GroupedConfig() for value in policies)
+        assert policies and all(value == HiFloat8GMMConfig() for value in policies)
     assert output.dtype == x.dtype
     output.float().square().mean().backward()
     assert bool(torch.isfinite(x.grad).all())
