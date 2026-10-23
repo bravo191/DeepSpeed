@@ -507,6 +507,31 @@ class _EngineBackwardGraphTracker:
 _ENGINE_BACKWARD_GRAPH_TRACKER = _EngineBackwardGraphTracker()
 
 
+def _fqn_join(prefix: str, child: str) -> str:
+    """Join a container prefix and a child name into a module FQN.
+
+    The root container's FQN is the empty string, and a dotted join on it
+    would produce a name no module can have.
+    """
+    return f"{prefix}.{child}" if prefix else child
+
+
+def _verify_hifloat8_converted(model, planned):
+    """Fail loudly when a planned module did not receive its policy.
+
+    ``quantize_`` with ``FqnToConfig`` ignores mapping keys that match no
+    module FQN without an error, so a planning bug would leave the affected
+    modules training in BF16 silently. The conversion contract attaches the
+    policy by identity to each converted module's ``config`` attribute;
+    unconverted modules hold none or ``None``.
+    """
+    for name, expected in planned:
+        module = model.get_submodule(name)
+        if getattr(module, "config", None) is not expected:
+            raise RuntimeError(f"HiFloat8 conversion did not attach its policy to {name!r}; the module "
+                               "would silently train in BF16 (check the selection FQNs against the model)")
+
+
 class DeepSpeedEngine(Module):
     r"""DeepSpeed engine for training."""
 
@@ -581,6 +606,7 @@ class DeepSpeedEngine(Module):
         self._configure_with_arguments(args, mpu)
         self.pipeline_parallelism = isinstance(model, PipelineModule)
         self._do_sanity_check()
+        self._validate_hifloat8_configuration()
         if self.log_level() is not None:
             set_log_level_from_string(self.log_level())
         eager_model_parameters = _model_parameters_need_remap(model_parameters)
@@ -619,6 +645,7 @@ class DeepSpeedEngine(Module):
 
         # Configure distributed model
         self._configure_distributed_model(model)
+        self._configure_hifloat8()
 
         # These hooks should be disabled later if DeepCompile is not active.
         self.module_forward_pre_hook = self._create_module_forward_pre_hook()
@@ -1675,6 +1702,9 @@ class DeepSpeedEngine(Module):
     def bfloat16_enabled(self):
         return self._config.bfloat16_config.enabled
 
+    def hifloat8_enabled(self):
+        return self._config.hifloat8_config["enabled"]
+
     def fp16_master_weights_and_gradients(self):
         return self._config.float16_config.fp16_master_weights_and_grads
 
@@ -2070,6 +2100,115 @@ class DeepSpeedEngine(Module):
         modules['module'] = model
         # register module attribute in engine but avoid getattr
         self.__dict__['module'] = model
+
+    def _validate_hifloat8_configuration(self):
+        if not self.hifloat8_enabled():
+            return
+        if not self.bfloat16_enabled():
+            raise RuntimeError("HiFloat8 training requires BF16 model parameters")
+        if self.pipeline_parallelism:
+            raise RuntimeError("HiFloat8 training has not been validated with DeepSpeed PipelineModule")
+        if self.autotp_size() > 1:
+            raise RuntimeError("HiFloat8 training has not been validated with DeepSpeed AutoTP")
+        if self.mpu is not None:
+            raise RuntimeError("HiFloat8 training has not been validated with a custom model-parallel unit")
+        if self.has_moe_layers and any(isinstance(module, MoE) for module in self.module.modules()):
+            raise RuntimeError("HiFloat8 experts require AutoEP, not the explicit DeepSpeed MoE layer")
+        if self.zero_optimization_stage() >= ZeroStageEnum.weights:
+            raise RuntimeError("HiFloat8 phase-1 supports DeepSpeed ZeRO stages 0, 1, and 2 only")
+
+    def _configure_hifloat8(self):
+        if not self.hifloat8_enabled():
+            return
+        self._validate_hifloat8_configuration()
+
+        from fnmatch import fnmatchcase
+        from deepspeed.moe.ep_experts import GroupedExperts
+
+        config = self._config.hifloat8_config
+        patterns = config["module_name_patterns"]
+        min_numel = config["min_numel"]
+        selected_names = []
+        selected_experts = []
+        total_numel = 0
+        for name, module in self.module.named_modules():
+            matrix_numel = getattr(module, "in_features", 0) * getattr(module, "out_features", 0)
+            if (type(module) is torch.nn.Linear and matrix_numel >= min_numel
+                    and any(fnmatchcase(name, pattern) for pattern in patterns)):
+                selected_names.append(name)
+                total_numel += matrix_numel
+            if (isinstance(module, GroupedExperts)
+                    and min(module.w1[0].numel(), module.w2[0].numel(), module.w3[0].numel()) >= min_numel
+                    and any(fnmatchcase(name, pattern) for pattern in patterns)):
+                selected_experts.append((name, module))
+        if not selected_names and not selected_experts:
+            raise RuntimeError("HiFloat8 module selection matched no nn.Linear or AutoEP GroupedExperts modules; "
+                               f"patterns={list(patterns)}, min_numel={min_numel}")
+
+        eligible_names = selected_names + [name for name, _ in selected_experts]
+        expected_count = config.get("expected_module_count")
+        if expected_count is not None and len(eligible_names) != expected_count:
+            raise RuntimeError(
+                f"HiFloat8 expected_module_count={expected_count}, selected {len(eligible_names)} modules")
+        unmatched = [pattern for pattern in patterns if not any(fnmatchcase(name, pattern) for name in eligible_names)]
+        if unmatched:
+            raise RuntimeError(f"HiFloat8 patterns matched no eligible modules: {unmatched}")
+        if any(getattr(module, "gate_up_impl", "auto") == "fused" for _name, module in selected_experts):
+            raise RuntimeError("HiFloat8 experts require separate gate/up projections")
+        expert_gemm_names = []
+        for container_name, container in selected_experts:
+            gemm_children = [
+                child_name for child_name, child in container.named_children()
+                if getattr(child, "is_torchao_grouped_gemm", False)
+            ]
+            if not gemm_children:
+                raise RuntimeError("HiFloat8 requires GroupedExperts constructed with use_grouped_mm=True; "
+                                   f"{container_name} exposes no grouped-GEMM modules")
+            expert_gemm_names.extend(_fqn_join(container_name, child_name) for child_name in gemm_children)
+
+        logger.info(
+            "HiFloat8 selected %d Linear modules (%d matrix elements); converting through the public quantize_ entry",
+            len(selected_names),
+            total_numel,
+        )
+        try:
+            provider = get_accelerator().get_hifloat8_provider()
+            if provider is None:
+                raise RuntimeError(f"No HiFloat8 provider on {get_accelerator().device_name()}")
+            # One training-op config drives both classes. The grouped kernels
+            # are validated once up front through the config's probe; the
+            # conversions themselves never probe, so a broken dense backend
+            # surfaces at the first training step.
+            policy = config.get("config") or {}
+            op_config = provider.HiFloat8Config.from_dict({"linear": policy, "grouped": policy})
+            if expert_gemm_names:
+                op_config.grouped_config.assert_kernels_available(device=self.device)
+            from torchao.quantization import FqnToConfig, quantize_
+
+            module_configs = {name: op_config for name in selected_names}
+            module_configs.update({name: op_config for name in expert_gemm_names})
+            quantize_(self.module, FqnToConfig(module_configs), filter_fn=None)
+            # FqnToConfig matches module FQNs exactly and quantize_ silently skips
+            # mapping keys that match no module, so a planning bug would leave
+            # modules training in BF16 without any error. Every converted module
+            # holds its policy by identity on the config attribute.
+            planned = [(name, op_config.linear_config) for name in selected_names]
+            planned.extend((name, op_config.grouped_config) for name in expert_gemm_names)
+            _verify_hifloat8_converted(self.module, planned)
+        except (ImportError, RuntimeError, ValueError, TypeError) as error:
+            raise RuntimeError(
+                f"HiFloat8 selected {len(selected_names)} Linear modules ({total_numel} matrix elements), "
+                f"but the HiFloat8 provider or conversion failed: {error}") from error
+        self.hifloat8_converted_module_names = tuple(selected_names)
+        self.hifloat8_grouped_module_names = tuple(name for name, _ in selected_experts)
+        logger.info("HiFloat8 enabled %d AutoEP grouped expert modules: %s", len(selected_experts),
+                    self.hifloat8_grouped_module_names)
+        logger.info(
+            "HiFloat8 training converted %d Linear modules (%d matrix elements): %s",
+            len(selected_names),
+            total_numel,
+            selected_names,
+        )
 
     def _configure_distributed_model(self, model):
         self._set_client_model(model)
@@ -4305,6 +4444,7 @@ class DeepSpeedEngine(Module):
 
         if checkpoint.get(FROZEN_PARAM_FRAGMENTS, None) is not None:
             saved_frozen_params = checkpoint[FROZEN_PARAM_FRAGMENTS]
+            restored_experts = DeepSpeedEngine._autoep_expert_parameter_names(None, self.module)
             for param in self.module.parameters():
                 if is_optimized_parameter(param):
                     continue
@@ -4313,6 +4453,10 @@ class DeepSpeedEngine(Module):
                 name = self.param_names[param]
                 if hasattr(param, 'ds_id'):
                     param.ds_tensor.data.copy_(saved_frozen_params[name].data)
+                elif name in restored_experts and name in module_state_dict:
+                    # AutoEP already loaded this rank's expert files above. The
+                    # shared checkpoint's frozen fragments belong to EP rank 0.
+                    continue
                 else:
                     param.data.copy_(saved_frozen_params[name].data)
 
