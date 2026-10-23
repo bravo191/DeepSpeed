@@ -311,31 +311,6 @@ def test_hifloat8_validation_rejects_custom_model_parallel_unit():
         engine._validate_hifloat8_configuration()
 
 
-@requires_npu
-def test_engine_grouped_kernel_failure_reports_selection_before_conversion(monkeypatch):
-    if not hasattr(torch, "npu"):
-        pytest.skip("NPU accelerator required")
-    # The grouped backend validation is an explicit engine step: a broken
-    # backend must fail before quantize_ touches any module.
-    from torchao.hifloat8 import HiFloat8GMMConfig
-    from deepspeed.moe.ep_experts import GroupedExperts
-
-    model = nn.ModuleDict({"experts": GroupedExperts(16, 32, 2, use_grouped_mm=True)})
-    parameters = dict(model.named_parameters())
-    error = RuntimeError("grouped kernels unavailable")
-
-    def unavailable(_self, *, device):
-        raise error
-
-    monkeypatch.setattr(HiFloat8GMMConfig, "assert_kernels_available", unavailable)
-    engine = _make_engine(model, ["experts"])
-    with pytest.raises(RuntimeError, match="conversion failed") as caught:
-        engine._configure_hifloat8()
-    assert caught.value.__cause__ is error
-    assert model.experts.gmm1.config is None
-    assert all(dict(model.named_parameters())[name] is p for name, p in parameters.items())
-
-
 @pytest.mark.parametrize("policy", [True, 1, "bf16", []])
 def test_hifloat8_config_rejects_non_object_policy(policy):
     with pytest.raises(DeepSpeedConfigError, match="hifloat8.config"):

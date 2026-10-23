@@ -2175,14 +2175,10 @@ class DeepSpeedEngine(Module):
             provider = get_accelerator().get_hifloat8_provider()
             if provider is None:
                 raise RuntimeError(f"No HiFloat8 provider on {get_accelerator().device_name()}")
-            # One training-op config drives both classes. The grouped kernels
-            # are validated once up front through the config's probe; the
-            # conversions themselves never probe, so a broken dense backend
-            # surfaces at the first training step.
+            # One training-op config drives both classes. Conversions never
+            # probe: a broken backend surfaces at the first training step.
             policy = config.get("config") or {}
             op_config = provider.HiFloat8Config.from_dict({"linear": policy, "grouped": policy})
-            if expert_gemm_names:
-                op_config.grouped_config.assert_kernels_available(device=self.device)
             from torchao.quantization import FqnToConfig, quantize_
 
             module_configs = {name: op_config for name in selected_names}

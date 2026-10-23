@@ -22,9 +22,8 @@ def get_hifloat8_provider():
         api = importlib.import_module("torchao.hifloat8")
     except ImportError as error:
         raise ImportError(f"TorchAO HiFloat8 API is unavailable. {hint}") from error
-    # The training-op config is the single required symbol: the grouped kernel
-    # validation travels with its grouped sub-config, and conversion attaches
-    # each module's policy to its config slot.
+    # The training-op config is the single required symbol: conversion
+    # attaches each module's policy to its config slot.
     required = ("HiFloat8Config", )
     missing = [name for name in required if not hasattr(api, name)]
     if missing:

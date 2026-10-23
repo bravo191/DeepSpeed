@@ -6,9 +6,9 @@ title: "TorchAO HiFloat8 training"
 ---
 
 DeepSpeed selects ordinary Linear and AutoEP GroupedExperts modules and converts
-both kinds through one public `torchao.quantization.quantize_` call after
-validating the grouped kernels through the config's `assert_kernels_available`;
-the conversions themselves never probe. DeepSpeed owns selection,
+both kinds through one public `torchao.quantization.quantize_` call; the
+conversions themselves never probe, so a broken backend surfaces at the first
+training step. DeepSpeed owns selection,
 activation, routing/padding, communication, optimizer and checkpoint lifecycle.
 TorchAO owns numerical policy and the quantization/GEMM implementations.
 
@@ -61,11 +61,10 @@ optional dependency/version availability. Unsupported accelerators fail before
 conversion. No NPU import or device-specific kernel selection occurs in Engine.
 
 `FqnToConfig` maps selected Linear modules and each expert container's
-grouped-GEMM modules to the single `HiFloat8Config`. The engine validates the
-grouped kernels once through the config's `assert_kernels_available` before
-conversion; the conversions themselves only swap the Linear class or replace
-the GEMM module's forward with the same contract backed by the low-precision
-kernel, without probing. Both
+grouped-GEMM modules to the single `HiFloat8Config`. The conversions only swap
+the Linear class or replace the GEMM module's forward with the same contract
+backed by the low-precision kernel, without probing; a broken backend surfaces
+at the first training step. Both
 preserve Parameter identity, names, metadata, `requires_grad`, mode and
 state-dict keys. There is no second model-conversion API or registry. The expert
 container remains owned by DeepSpeed and retains its activation and
@@ -86,9 +85,8 @@ Install `torchao>=0.18,<0.19` and the paired Ascend extension exposing the singl
 `HiFloat8Config` symbol. An upstream Linear-only extension is insufficient.
 No backend import or user preloading step is required. Missing APIs, versions or an
 invalid policy fail before conversion. DeepSpeed requires nothing else from the
-extension: the cached kernel validation (`grouped_config.assert_kernels_available`)
-travels with the config object, and conversion attaches each expert GEMM's policy to
-the module's `config` slot; policy parsing uses `HiFloat8Config.from_dict`.
+extension: conversion attaches each expert GEMM's policy to the module's `config`
+slot, and policy parsing uses `HiFloat8Config.from_dict`.
 
 Missing, null or empty `config` uses the established input/weight/gradient scale
 denominators `15/15/224`. Explicit overrides remain supported. `compute_dtype`
