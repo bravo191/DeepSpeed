@@ -471,3 +471,43 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
     assert bool(torch.isfinite(x.grad).all())
     assert all(parameter.grad is not None and bool(torch.isfinite(parameter.grad).all())
                for parameter in model.parameters())
+
+
+def test_engine_converts_a_bare_root_grouped_experts_container(monkeypatch):
+    # The root container's FQN is the empty string; the GEMM child names must
+    # join without a leading dot or the mapping silently misses every module.
+    from deepspeed.accelerator import get_accelerator
+    from deepspeed.moe.ep_experts import GroupedExperts
+    from torchao.hifloat8 import HiFloat8GMMConfig
+
+    monkeypatch.setattr(get_accelerator(), "get_grouped_mm", lambda: object())
+    model = GroupedExperts(16, 32, 2, use_grouped_mm=True)
+    keys_before = tuple(model.state_dict())
+    parameters_before = dict(model.named_parameters())
+    engine = _make_engine(model, ["*"])
+    engine._configure_hifloat8()
+    assert model.gmm1.config is not None
+    assert model.gmm1.config == HiFloat8GMMConfig()
+    assert model.gmm2.config is model.gmm1.config
+    assert model.gmm3.config is model.gmm1.config
+    assert tuple(model.state_dict()) == keys_before
+    assert all(dict(model.named_parameters())[name] is value for name, value in parameters_before.items())
+
+
+def test_engine_fails_loudly_when_a_planned_conversion_misses(monkeypatch):
+    # quantize_ silently skips FqnToConfig keys matching no module FQN; the
+    # post-conversion check must turn that into an error, not a BF16 no-op.
+    import torchao.quantization as quantization
+    from deepspeed.accelerator import get_accelerator
+    from deepspeed.moe.ep_experts import GroupedExperts
+
+    monkeypatch.setattr(get_accelerator(), "get_grouped_mm", lambda: object())
+
+    def unconverted(model, config, **kwargs):
+        return None
+
+    monkeypatch.setattr(quantization, "quantize_", unconverted)
+    model = GroupedExperts(16, 32, 2, use_grouped_mm=True)
+    engine = _make_engine(model, ["*"])
+    with pytest.raises(RuntimeError, match="did not attach its policy"):
+        engine._configure_hifloat8()

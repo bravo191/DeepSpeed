@@ -507,6 +507,31 @@ class _EngineBackwardGraphTracker:
 _ENGINE_BACKWARD_GRAPH_TRACKER = _EngineBackwardGraphTracker()
 
 
+def _fqn_join(prefix: str, child: str) -> str:
+    """Join a container prefix and a child name into a module FQN.
+
+    The root container's FQN is the empty string, and a dotted join on it
+    would produce a name no module can have.
+    """
+    return f"{prefix}.{child}" if prefix else child
+
+
+def _verify_hifloat8_converted(model, planned):
+    """Fail loudly when a planned module did not receive its policy.
+
+    ``quantize_`` with ``FqnToConfig`` ignores mapping keys that match no
+    module FQN without an error, so a planning bug would leave the affected
+    modules training in BF16 silently. The conversion contract attaches the
+    policy by identity to each converted module's ``config`` attribute;
+    unconverted modules hold none or ``None``.
+    """
+    for name, expected in planned:
+        module = model.get_submodule(name)
+        if getattr(module, "config", None) is not expected:
+            raise RuntimeError(f"HiFloat8 conversion did not attach its policy to {name!r}; the module "
+                               "would silently train in BF16 (check the selection FQNs against the model)")
+
+
 class DeepSpeedEngine(Module):
     r"""DeepSpeed engine for training."""
 
@@ -2139,7 +2164,7 @@ class DeepSpeedEngine(Module):
             if not gemm_children:
                 raise RuntimeError("HiFloat8 requires GroupedExperts constructed with use_grouped_mm=True; "
                                    f"{container_name} exposes no grouped-GEMM modules")
-            expert_gemm_names.extend(f"{container_name}.{child_name}" for child_name in gemm_children)
+            expert_gemm_names.extend(_fqn_join(container_name, child_name) for child_name in gemm_children)
 
         logger.info(
             "HiFloat8 selected %d Linear modules (%d matrix elements); converting through the public quantize_ entry",
@@ -2163,6 +2188,13 @@ class DeepSpeedEngine(Module):
             module_configs = {name: op_config for name in selected_names}
             module_configs.update({name: op_config for name in expert_gemm_names})
             quantize_(self.module, FqnToConfig(module_configs), filter_fn=None)
+            # FqnToConfig matches module FQNs exactly and quantize_ silently skips
+            # mapping keys that match no module, so a planning bug would leave
+            # modules training in BF16 without any error. Every converted module
+            # holds its policy by identity on the config attribute.
+            planned = [(name, op_config.linear_config) for name in selected_names]
+            planned.extend((name, op_config.grouped_config) for name in expert_gemm_names)
+            _verify_hifloat8_converted(self.module, planned)
         except (ImportError, RuntimeError, ValueError, TypeError) as error:
             raise RuntimeError(
                 f"HiFloat8 selected {len(selected_names)} Linear modules ({total_numel} matrix elements), "
