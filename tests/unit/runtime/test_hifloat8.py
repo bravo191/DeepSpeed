@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -116,18 +117,18 @@ def test_hifloat8_config_selects_torchao_npu():
 def test_torchao_backend_preserves_dense_and_grouped_parameters(policy, monkeypatch):
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("NPU unavailable")
-    import torchao.hifloat8.hifloat8_gmm as grouped_kernels
+    grouped_kernels = importlib.import_module("torchao.hifloat8.hifloat8_gmm")
     from deepspeed.moe.ep_experts import GroupedExperts
     from torchao.hifloat8 import HiFloat8GMMConfig, HiFloat8Linear
 
     policies = []
-    original = grouped_kernels._hifloat8_gmm
+    original = grouped_kernels.hifloat8_gmm
 
     def recorded(x, weight, offsets, **kwargs):
         policies.append(kwargs["config"])
         return original(x, weight, offsets, **kwargs)
 
-    monkeypatch.setattr(grouped_kernels, "_hifloat8_gmm", recorded)
+    monkeypatch.setattr(grouped_kernels, "hifloat8_gmm", recorded)
     model = nn.ModuleDict({
         "dense": nn.Linear(16, 16, bias=False),
         "experts": GroupedExperts(16, 32, 2, use_grouped_mm=True),
@@ -405,15 +406,15 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
     keys = tuple(model.state_dict())
     calls = []
     policies = []
-    import torchao.hifloat8.hifloat8_gmm as grouped_kernels
+    grouped_kernels = importlib.import_module("torchao.hifloat8.hifloat8_gmm")
     from torchao.hifloat8 import HiFloat8GMMConfig
-    original_grouped = grouped_kernels._hifloat8_gmm
+    original_grouped = grouped_kernels.hifloat8_gmm
 
     def recorded_grouped(x, weight, offsets, **kwargs):
         policies.append(kwargs["config"])
         return original_grouped(x, weight, offsets, **kwargs)
 
-    monkeypatch.setattr(grouped_kernels, "_hifloat8_gmm", recorded_grouped)
+    monkeypatch.setattr(grouped_kernels, "hifloat8_gmm", recorded_grouped)
     original = quantization.quantize_
 
     def counted(actual_model, config, **kwargs):

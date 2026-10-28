@@ -13,6 +13,7 @@ parallel routing is validated separately with a model integration run.
 """
 import argparse
 import copy
+import importlib
 import json
 import os
 from pathlib import Path
@@ -24,7 +25,7 @@ import deepspeed.comm as dist
 from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.runtime.fp16.loss_scaler import LossScaler
 from torchao.hifloat8 import HiFloat8GMMConfig, HiFloat8LinearConfig
-import torchao.hifloat8.hifloat8_gmm as grouped_kernels
+grouped_kernels = importlib.import_module("torchao.hifloat8.hifloat8_gmm")
 
 
 class Model(torch.nn.Module):
@@ -104,13 +105,13 @@ def main():
     targets = [torch.randn(32, 128, generator=generator).bfloat16().to('npu') * 0.01 for _ in range(8)]
 
     observed_policies = []
-    original_grouped_mm = grouped_kernels._hifloat8_gmm
+    original_grouped_mm = grouped_kernels.hifloat8_gmm
 
     def recorded_grouped_mm(x, weight, offsets, **kwargs):
         observed_policies.append(kwargs["config"])
         return original_grouped_mm(x, weight, offsets, **kwargs)
 
-    grouped_kernels._hifloat8_gmm = recorded_grouped_mm
+    grouped_kernels.hifloat8_gmm = recorded_grouped_mm
 
     def create():
         model = Model().bfloat16()
