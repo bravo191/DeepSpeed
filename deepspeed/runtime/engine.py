@@ -516,6 +516,17 @@ def _fqn_join(prefix: str, child: str) -> str:
     return f"{prefix}.{child}" if prefix else child
 
 
+# torchao_npu leaves the quantization ranges to the caller (config defaults
+# are the operator's native behavior). Absent JSON fields fall back to this
+# validated dense/grouped training recipe; explicit values — including null
+# for native ranges — pass through.
+HIFLOAT8_DEFAULT_RECIPE = {
+    "input_dst_type_max": 15.0,
+    "weight_dst_type_max": 15.0,
+    "grad_dst_type_max": 224.0,
+}
+
+
 def _verify_hifloat8_converted(model, planned):
     """Fail loudly when a planned module did not receive its policy.
 
@@ -2182,7 +2193,8 @@ class DeepSpeedEngine(Module):
             )
             # One training-op config drives both classes. Conversions never
             # probe: a broken backend surfaces at the first training step.
-            policy = config.get("config") or {}
+            user_policy = config.get("config") or {}
+            policy = {**HIFLOAT8_DEFAULT_RECIPE, **user_policy}
             op_config = provider.HiFloat8Config.from_dict({"linear": policy, "grouped": policy})
             from torchao.quantization import FqnToConfig, quantize_
 

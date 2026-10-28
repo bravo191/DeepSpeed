@@ -23,6 +23,7 @@ import torch_npu  # noqa: F401
 import deepspeed
 import deepspeed.comm as dist
 from deepspeed.moe.ep_experts import GroupedExperts
+from deepspeed.runtime.engine import HIFLOAT8_DEFAULT_RECIPE
 from deepspeed.runtime.fp16.loss_scaler import LossScaler
 from torchao.hifloat8 import HiFloat8GMMConfig, HiFloat8LinearConfig
 grouped_kernels = importlib.import_module("torchao.hifloat8.hifloat8_gmm")
@@ -125,7 +126,8 @@ def main():
         observed_policies.clear()
         loss = (engine(batches[i]).float() - targets[i].float()).square().mean()
         # The grouped GEMM carries the grouped sub-config of the same default recipe.
-        assert observed_policies and all(policy == HiFloat8GMMConfig() for policy in observed_policies)
+        assert observed_policies and all(
+            policy == HiFloat8GMMConfig.from_dict(HIFLOAT8_DEFAULT_RECIPE) for policy in observed_policies)
         engine.backward(loss)
         engine.step()
         return float(loss.detach())

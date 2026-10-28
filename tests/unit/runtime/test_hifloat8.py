@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from deepspeed.runtime.config import DeepSpeedConfigError, get_hifloat8_config
-from deepspeed.runtime.engine import DeepSpeedEngine
+from deepspeed.runtime.engine import DeepSpeedEngine, HIFLOAT8_DEFAULT_RECIPE
 
 # Native tests require the public API; a missing extension must fail there.
 # Gate only device availability, without importing TorchAO during collection.
@@ -148,7 +148,8 @@ def test_torchao_backend_preserves_dense_and_grouped_parameters(policy, monkeypa
     assert model["experts"].gmm1.config is not None
     x = torch.randn(16, 16, device="npu", dtype=torch.bfloat16)
     model["experts"](model["dense"](x), torch.tensor([0, 16], device="npu", dtype=torch.int64))
-    assert policies and all(value == (HiFloat8GMMConfig.from_dict(policy) if policy else HiFloat8GMMConfig())
+    assert policies and all(value == (HiFloat8GMMConfig.from_dict(policy) if policy
+                                      else HiFloat8GMMConfig.from_dict(HIFLOAT8_DEFAULT_RECIPE))
                             for value in policies)
     assert model["dense"].config.grad_dst_type_max == (policy.get("grad_dst_type_max", 224) if policy else 224)
     assert tuple(model.state_dict()) == keys_before
@@ -441,7 +442,8 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
         assert model.gmm1.config is not None
         output = model(x, counts)
     if kind == "mixed":
-        assert policies and all(value == HiFloat8GMMConfig() for value in policies)
+        assert policies and all(value == HiFloat8GMMConfig.from_dict(HIFLOAT8_DEFAULT_RECIPE)
+                                for value in policies)
     assert output.dtype == x.dtype
     output.float().square().mean().backward()
     assert bool(torch.isfinite(x.grad).all())
@@ -463,7 +465,7 @@ def test_engine_converts_a_bare_root_grouped_experts_container(monkeypatch):
     engine = _make_engine(model, ["*"])
     engine._configure_hifloat8()
     assert model.gmm1.config is not None
-    assert model.gmm1.config == HiFloat8GMMConfig()
+    assert model.gmm1.config == HiFloat8GMMConfig.from_dict(HIFLOAT8_DEFAULT_RECIPE)
     assert model.gmm2.config is model.gmm1.config
     assert model.gmm3.config is model.gmm1.config
     assert tuple(model.state_dict()) == keys_before
