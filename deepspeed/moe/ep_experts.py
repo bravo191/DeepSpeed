@@ -376,19 +376,13 @@ class GroupedGemm(nn.Module):
     The module is stateless by contract: it holds no Parameter and registers
     nothing, so attaching it to the container leaves the model structure —
     state_dict keys, named parameters, checkpoints — exactly as before. The
-    weight and the storage layout travel as forward arguments; the conversion
-    config slot is the module's only attribute. The default forward is the
-    accelerator's high-precision kernel; the quantization handler swaps the
-    forward for the same contract backed by the low-precision kernel. Routing,
-    padding and activation stay in :class:`GroupedExperts`.
+    weight and the storage layout travel as forward arguments. The default
+    forward is the accelerator's high-precision kernel; a quantization
+    library converts the module in place by swapping in its own subclass,
+    which carries the policy on the same forward contract backed by the
+    low-precision kernel. Routing, padding and activation stay in
+    :class:`GroupedExperts`.
     """
-
-    # Structural marker read by the quantization library without importing this class.
-    is_torchao_grouped_gemm = True
-
-    def __init__(self):
-        super().__init__()
-        self.config = None
 
     def forward(self, x, weight, offsets, trans_b):
         grouped_mm = get_accelerator().get_grouped_mm()

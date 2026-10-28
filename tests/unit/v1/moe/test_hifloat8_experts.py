@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.moe.ep_experts import GroupedExperts
+from deepspeed.moe.ep_experts import GroupedExperts, GroupedGemm
 
 
 def test_gemm_modules_do_not_change_the_model_structure(monkeypatch):
@@ -20,7 +20,9 @@ def test_gemm_modules_do_not_change_the_model_structure(monkeypatch):
     experts = GroupedExperts(8, 16, 2, use_grouped_mm=True)
     assert tuple(experts.state_dict()) == ("w1", "w2", "w3")
     assert tuple(experts.named_parameters()) == (("w1", experts.w1), ("w2", experts.w2), ("w3", experts.w3))
-    assert all(getattr(module, attr, None) is None for module in experts.children() for attr in ("weight", "trans_b"))
+    assert all(getattr(module, attr, None) is None
+               for module in experts.children()
+               for attr in ("weight", "trans_b", "config"))
 
 
 @pytest.mark.parametrize("counts", [[2, 1], [0, 3], [3, 0], [0, 0]])
@@ -132,7 +134,7 @@ def test_npu_hifloat8_expert_forward_and_gradients(counts, dim, hidden_dim, back
         provider = get_accelerator().get_hifloat8_provider()
         op_config = provider.HiFloat8Config.from_dict({"grouped": {}})
         gemm_names = [
-            name for name, child in candidate.named_children() if getattr(child, "is_torchao_grouped_gemm", False)
+            name for name, child in candidate.named_children() if isinstance(child, GroupedGemm)
         ]
         quantize_(candidate, FqnToConfig(OrderedDict((name, op_config) for name in gemm_names)), filter_fn=None)
     x = torch.randn(sum(counts), dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
@@ -226,7 +228,7 @@ def test_npu_provider_experts_preserve_bfloat16_residual_with_float16_compute():
 
     provider = get_accelerator().get_hifloat8_provider()
     op_config = provider.HiFloat8Config.from_dict({"grouped": {"compute_dtype": "float16"}})
-    gemm_names = [name for name, child in experts.named_children() if getattr(child, "is_torchao_grouped_gemm", False)]
+    gemm_names = [name for name, child in experts.named_children() if isinstance(child, GroupedGemm)]
     quantize_(experts, FqnToConfig(OrderedDict((name, op_config) for name in gemm_names)), filter_fn=None)
     counts = torch.tensor([0, 8, 0, 4], device="npu", dtype=torch.int64)
     x = torch.randn(15, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)

@@ -2156,25 +2156,30 @@ class DeepSpeedEngine(Module):
         if any(getattr(module, "gate_up_impl", "auto") == "fused" for _name, module in selected_experts):
             raise RuntimeError("HiFloat8 experts require separate gate/up projections")
         expert_gemm_names = []
-        for container_name, container in selected_experts:
-            gemm_children = [
-                child_name for child_name, child in container.named_children()
-                if getattr(child, "is_torchao_grouped_gemm", False)
-            ]
-            if not gemm_children:
-                raise RuntimeError("HiFloat8 requires GroupedExperts constructed with use_grouped_mm=True; "
-                                   f"{container_name} exposes no grouped-GEMM modules")
-            expert_gemm_names.extend(_fqn_join(container_name, child_name) for child_name in gemm_children)
-
-        logger.info(
-            "HiFloat8 selected %d Linear modules (%d matrix elements); converting through the public quantize_ entry",
-            len(selected_names),
-            total_numel,
-        )
         try:
             provider = get_accelerator().get_hifloat8_provider()
             if provider is None:
                 raise RuntimeError(f"No HiFloat8 provider on {get_accelerator().device_name()}")
+            # The GEMM children are the container's own forward contract
+            # (gmm1/gmm2/gmm3); recognizing them by attribute keeps the
+            # engine free of quantization-library class names, and the
+            # attributes survive a conversion that swaps the child's class.
+            for container_name, container in selected_experts:
+                gemm_children = [
+                    child_name for child_name in ("gmm1", "gmm2", "gmm3")
+                    if getattr(container, child_name, None) is not None
+                ]
+                if not gemm_children:
+                    raise RuntimeError("HiFloat8 requires GroupedExperts constructed with use_grouped_mm=True; "
+                                       f"{container_name} exposes no grouped-GEMM modules")
+                expert_gemm_names.extend(_fqn_join(container_name, child_name) for child_name in gemm_children)
+
+            logger.info(
+                "HiFloat8 selected %d Linear modules (%d matrix elements); "
+                "converting through the public quantize_ entry",
+                len(selected_names),
+                total_numel,
+            )
             # One training-op config drives both classes. Conversions never
             # probe: a broken backend surfaces at the first training step.
             policy = config.get("config") or {}

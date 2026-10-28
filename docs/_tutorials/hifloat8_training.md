@@ -62,7 +62,7 @@ conversion. No NPU import or device-specific kernel selection occurs in Engine.
 
 `FqnToConfig` maps selected Linear modules and each expert container's
 grouped-GEMM modules to the single `HiFloat8Config`. The conversions only swap
-the Linear class or replace the GEMM module's forward with the same contract
+the Linear class or the GEMM module's class for the same contract
 backed by the low-precision kernel, without probing; a broken backend surfaces
 at the first training step. Both
 preserve Parameter identity, names, metadata, `requires_grad`, mode and
