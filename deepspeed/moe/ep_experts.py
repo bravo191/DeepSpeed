@@ -12,7 +12,7 @@ Grouped expert computation for expert parallelism.
 
 Ported from TorchTitan's GroupedExperts with adaptations for DeepSpeed:
   - Replaced hardcoded .bfloat16() with input-dtype-aware casting
-  - Fail-fast RuntimeError when use_grouped_mm=True but torch._grouped_mm is unavailable
+  - Fail-fast RuntimeError when use_grouped_mm=True but no grouped-GEMM backend is available
   - Removed DTensor-specific code paths
 
 This module is self-contained: no imports from deepspeed.module_inject
@@ -369,10 +369,53 @@ def _run_experts_triton_grouped_mm(
 # ---------------------------------------------------------------------------
 
 
+class GroupedGemm(nn.Module):
+    """One grouped GEMM of an expert MLP, exposed as a module for in-place
+    conversion by the quantization library.
+
+    The module is stateless by contract: it holds no Parameter and registers
+    nothing, so attaching it to the container leaves the model structure —
+    state_dict keys, named parameters, checkpoints — exactly as before. The
+    weight and the storage layout travel as forward arguments. The default
+    forward is the accelerator's high-precision kernel; a quantization
+    library converts the module in place by swapping in its own subclass,
+    which carries the policy on the same forward contract backed by the
+    low-precision kernel. Routing, padding and activation stay in
+    :class:`GroupedExperts`.
+    """
+
+    def forward(self, x, weight, offsets, trans_b):
+        grouped_mm = get_accelerator().get_grouped_mm()
+        if grouped_mm is None:
+            raise RuntimeError("The current accelerator does not provide a grouped GEMM backend")
+        return grouped_mm(x, weight.to(x.dtype), offsets, trans_b=trans_b).to(x.dtype)
+
+
+def _run_experts_with_gemm_modules(experts, x, num_tokens_per_expert, activation="swiglu", alpha=1.702, limit=7.0):
+    """Keep routing, padding and activation independent of the GEMM backend."""
+    offsets = num_tokens_per_expert.cumsum(0).to(torch.int64)
+    rows = int(offsets[-1].item())
+    if rows < 0 or rows > x.shape[0]:
+        raise ValueError("Expert token counts exceed the available rows")
+    inputs = x[:rows]
+
+    gate = experts.gmm1(inputs, experts.w1, offsets, trans_b=True)
+    up = experts.gmm3(inputs, experts.w3, offsets, trans_b=True)
+    hidden = apply_expert_activation(gate, up, activation, alpha, limit, fused=False)
+    output = experts.gmm2(hidden, experts.w2, offsets, trans_b=True)
+    if rows == x.shape[0]:
+        return output
+    return torch.cat((output, output.new_zeros((x.shape[0] - rows, output.shape[-1]))))
+
+
 class GroupedExperts(nn.Module):
     """Grouped expert computation for MoE layers.
 
-    Supports three execution paths:
+    Supports four execution paths:
+      - **gemm modules**: One :class:`GroupedGemm` per projection (built when the
+        accelerator provides a grouped GEMM) routes each GEMM through a
+        convertible module — the accelerator's high-precision kernel by default,
+        or a quantization library's converted forward in place.
       - **triton_grouped_mm**: Uses a Triton grouped-GEMM kernel
         (``deepspeed.ops.triton_ops.group_gemm_triton``). Auto-selected on sm80/sm86 where
         ``torch._grouped_mm`` would otherwise fall back to a slow per-group loop.
@@ -380,7 +423,7 @@ class GroupedExperts(nn.Module):
         (requires a sufficiently recent PyTorch build).
       - **for-loop**: Sequential per-expert matmuls; always available.
 
-    If ``use_grouped_mm=True`` but neither the Triton path nor
+    If ``use_grouped_mm=True`` but none of the GEMM modules, the Triton path or
     ``torch._grouped_mm`` is available, the constructor raises ``RuntimeError``.
     Set ``use_grouped_mm=False`` to select the sequential for-loop path.
 
@@ -437,7 +480,8 @@ class GroupedExperts(nn.Module):
         if use_grouped_mm and not disable_triton_grouped_mm:
             self.use_triton_grouped_mm = get_accelerator().prefer_triton_grouped_mm()
 
-        if use_grouped_mm and not hasattr(torch, "_grouped_mm") and not self.use_triton_grouped_mm:
+        if (use_grouped_mm and not hasattr(torch, "_grouped_mm") and not self.use_triton_grouped_mm
+                and get_accelerator().get_grouped_mm() is None):
             raise RuntimeError("GroupedExperts was constructed with use_grouped_mm=True but "
                                "torch._grouped_mm is not available in this PyTorch build. "
                                "Upgrade PyTorch to a build that provides torch._grouped_mm, install "
@@ -452,6 +496,16 @@ class GroupedExperts(nn.Module):
             raise ValueError('gate_up_impl="fused" runs the gate and up projections as one torch._grouped_mm, '
                              f"but {selected} was selected. Set use_grouped_mm=true and, on devices that prefer "
                              'the Triton kernel, disable_triton_grouped_mm=true, or leave gate_up_impl unset.')
+
+        # One stateless GEMM module per projection keeps the container's
+        # parameters and state-dict keys untouched while exposing each GEMM
+        # for in-place conversion by the quantization library.
+        if use_grouped_mm and get_accelerator().get_grouped_mm() is not None:
+            self.gmm1 = GroupedGemm()
+            self.gmm2 = GroupedGemm()
+            self.gmm3 = GroupedGemm()
+        else:
+            self.gmm1 = self.gmm2 = self.gmm3 = None
 
         if use_grouped_mm and self.use_triton_grouped_mm:
             warning_once("Triton grouped-GEMM path is selected for grouped_gemm. "
@@ -474,6 +528,11 @@ class GroupedExperts(nn.Module):
         """
 
         act = (self.activation, self.activation_alpha, self.activation_limit)
+        accelerator = get_accelerator()
+        if self.gmm1 is not None and accelerator.on_accelerator(x):
+            if getattr(self, "gate_up_impl", "auto") == "fused":
+                raise RuntimeError("The accelerator grouped GEMM override requires separate gate/up projections")
+            return _run_experts_with_gemm_modules(self, x, num_tokens_per_expert, *act)
         if self.use_triton_grouped_mm:
             return _run_experts_triton_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert, *act)
         elif self.use_grouped_mm:
