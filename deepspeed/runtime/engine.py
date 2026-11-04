@@ -507,6 +507,42 @@ class _EngineBackwardGraphTracker:
 _ENGINE_BACKWARD_GRAPH_TRACKER = _EngineBackwardGraphTracker()
 
 
+def _fqn_join(prefix: str, child: str) -> str:
+    """Join a container prefix and a child name into a module FQN.
+
+    The root container's FQN is the empty string, and a dotted join on it
+    would produce a name no module can have.
+    """
+    return f"{prefix}.{child}" if prefix else child
+
+
+# torchao_npu leaves the quantization ranges to the caller (config defaults
+# are the operator's native behavior). Absent JSON fields fall back to this
+# validated dense/grouped training recipe; explicit values — including null
+# for native ranges — pass through.
+HIFLOAT8_DEFAULT_RECIPE = {
+    "input_dst_type_max": 15.0,
+    "weight_dst_type_max": 15.0,
+    "grad_dst_type_max": 224.0,
+}
+
+
+def _verify_hifloat8_converted(model, planned):
+    """Fail loudly when a planned module did not receive its policy.
+
+    ``quantize_`` with ``FqnToConfig`` ignores mapping keys that match no
+    module FQN without an error, so a planning bug would leave the affected
+    modules training in BF16 silently. The conversion contract attaches the
+    policy by identity to each converted module's ``config`` attribute;
+    unconverted modules hold none or ``None``.
+    """
+    for name, expected in planned:
+        module = model.get_submodule(name)
+        if getattr(module, "config", None) is not expected:
+            raise RuntimeError(f"HiFloat8 conversion did not attach its policy to {name!r}; the module "
+                               "would silently train in BF16 (check the selection FQNs against the model)")
+
+
 class DeepSpeedEngine(Module):
     r"""DeepSpeed engine for training."""
 
@@ -2130,35 +2166,52 @@ class DeepSpeedEngine(Module):
             raise RuntimeError(f"HiFloat8 patterns matched no eligible modules: {unmatched}")
         if any(getattr(module, "gate_up_impl", "auto") == "fused" for _name, module in selected_experts):
             raise RuntimeError("HiFloat8 experts require separate gate/up projections")
-
-        logger.info(
-            "HiFloat8 selected %d Linear modules (%d matrix elements); probing native kernels before conversion",
-            len(selected_names),
-            total_numel,
-        )
+        expert_gemm_names = []
         try:
             provider = get_accelerator().get_hifloat8_provider()
             if provider is None:
                 raise RuntimeError(f"No HiFloat8 provider on {get_accelerator().device_name()}")
-            policy = provider.HiFloat8Config.from_dict(config.get("config"))
-            grouped_policy = None
-            if selected_experts:
-                if not hasattr(provider, "HiFloat8GroupedConfig"):
-                    raise ImportError("Install a compatible TorchAO extension providing HiFloat8GroupedConfig")
-                grouped_policy = provider.HiFloat8GroupedConfig.from_dict(config.get("config"))
-            provider.assert_hifloat8_training_available(device=self.device,
-                                                        config=policy,
-                                                        linear=bool(selected_names),
-                                                        grouped=bool(selected_experts))
+            # The GEMM children are the container's own forward contract
+            # (gmm1/gmm2/gmm3); recognizing them by attribute keeps the
+            # engine free of quantization-library class names, and the
+            # attributes survive a conversion that swaps the child's class.
+            for container_name, container in selected_experts:
+                gemm_children = [
+                    child_name for child_name in ("gmm1", "gmm2", "gmm3")
+                    if getattr(container, child_name, None) is not None
+                ]
+                if not gemm_children:
+                    raise RuntimeError("HiFloat8 requires GroupedExperts constructed with use_grouped_mm=True; "
+                                       f"{container_name} exposes no grouped-GEMM modules")
+                expert_gemm_names.extend(_fqn_join(container_name, child_name) for child_name in gemm_children)
+
+            logger.info(
+                "HiFloat8 selected %d Linear modules (%d matrix elements); "
+                "converting through the public quantize_ entry",
+                len(selected_names),
+                total_numel,
+            )
+            # One training-op config drives both classes. Conversions never
+            # probe: a broken backend surfaces at the first training step.
+            user_policy = config.get("config") or {}
+            policy = {**HIFLOAT8_DEFAULT_RECIPE, **user_policy}
+            op_config = provider.HiFloat8Config.from_dict({"linear": policy, "grouped": policy})
+            from torchao.quantization import FqnToConfig, quantize_
+
+            module_configs = {name: op_config for name in selected_names}
+            module_configs.update({name: op_config for name in expert_gemm_names})
+            quantize_(self.module, FqnToConfig(module_configs), filter_fn=None)
+            # FqnToConfig matches module FQNs exactly and quantize_ silently skips
+            # mapping keys that match no module, so a planning bug would leave
+            # modules training in BF16 without any error. Every converted module
+            # holds its policy by identity on the config attribute.
+            planned = [(name, op_config.linear_config) for name in selected_names]
+            planned.extend((name, op_config.grouped_config) for name in expert_gemm_names)
+            _verify_hifloat8_converted(self.module, planned)
         except (ImportError, RuntimeError, ValueError, TypeError) as error:
             raise RuntimeError(
                 f"HiFloat8 selected {len(selected_names)} Linear modules ({total_numel} matrix elements), "
-                f"but provider/native kernel validation failed before conversion: {error}") from error
-        from torchao.quantization import ModuleFqnToConfig, quantize_
-
-        module_configs = {name: policy for name in selected_names}
-        module_configs.update({name: grouped_policy for name, _module in selected_experts})
-        quantize_(self.module, ModuleFqnToConfig(module_configs), filter_fn=None)
+                f"but the HiFloat8 provider or conversion failed: {error}") from error
         self.hifloat8_converted_module_names = tuple(selected_names)
         self.hifloat8_grouped_module_names = tuple(name for name, _ in selected_experts)
         logger.info("HiFloat8 enabled %d AutoEP grouped expert modules: %s", len(selected_experts),
